@@ -1,23 +1,31 @@
-import requests
-from bs4 import BeautifulSoup
 import json
 import re
-import time
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urljoin
+
+from playwright.sync_api import sync_playwright
+
 
 MAX_DISCOUNT_RATE = 0.50
 
 WATSONS_URL = "https://www.watsons.com.tw/全部商品/c/1"
 WATSONS_BASE = "https://www.watsons.com.tw"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
-        "AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
-    ),
-    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8"
-}
+BLOCKED_WORDS = [
+    "買2件",
+    "買二件",
+    "買 2 件",
+    "第二件",
+    "第2件",
+    "買一送一",
+    "買1送1",
+    "加價購",
+    "任選",
+    "任2",
+    "任3",
+    "任4",
+    "組合價",
+]
 
 
 def clean_price(text):
@@ -25,6 +33,7 @@ def clean_price(text):
         return None
 
     text = text.replace(",", "")
+
     match = re.search(r"\$?\s*(\d+)", text)
 
     if not match:
@@ -33,44 +42,40 @@ def clean_price(text):
     return int(match.group(1))
 
 
-def add_product(products, store, name, original, sale, url):
+def blocked(text):
+    text = text or ""
 
-    if not name or not original or not sale:
-        return
+    for word in BLOCKED_WORDS:
+        if word in text:
+            return True
+
+    return False
+
+
+def add_product(products, name, original, sale, url):
+
+    if not name:
+        return False
+
+    if not original or not sale:
+        return False
 
     if original <= 0 or sale <= 0:
-        return
+        return False
 
     if sale >= original:
-        return
+        return False
 
     rate = sale / original
 
     if rate > MAX_DISCOUNT_RATE:
-        return
+        return False
 
-    # 排除條件式優惠
-    bad_words = [
-        "買2件",
-        "買二件",
-        "第二件",
-        "第2件",
-        "買一送一",
-        "買1送1",
-        "加價購",
-        "任選",
-        "任2",
-        "任3",
-        "任4",
-        "組合價"
-    ]
-
-    for word in bad_words:
-        if word in name:
-            return
+    if blocked(name):
+        return False
 
     products.append({
-        "store": store,
+        "store": "屈臣氏",
         "name": name.strip(),
         "original": original,
         "sale": sale,
@@ -80,203 +85,279 @@ def add_product(products, store, name, original, sale, url):
         "url": url
     })
 
+    return True
+
 
 def scrape_watsons(products):
 
     print("")
-    print("========================")
-    print("開始掃描屈臣氏")
-    print("========================")
+    print("==============================")
+    print("開始掃描屈臣氏 Playwright")
+    print("==============================")
 
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    with sync_playwright() as p:
 
-    page = 0
-    max_pages = 1000
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage"
+            ]
+        )
 
-    while page < max_pages:
+        context = browser.new_context(
+            locale="zh-TW",
+            viewport={
+                "width": 1440,
+                "height": 1600
+            },
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/140.0.0.0 Safari/537.36"
+            )
+        )
 
-        url = f"{WATSONS_URL}?page={page}"
+        page = context.new_page()
 
-        print("")
-        print("掃描第", page + 1, "頁")
-        print(url)
+        print("開啟：")
+        print(WATSONS_URL)
 
         try:
 
-            response = session.get(url, timeout=30)
+            response = page.goto(
+                WATSONS_URL,
+                wait_until="domcontentloaded",
+                timeout=60000
+            )
 
-            print("HTTP:", response.status_code)
+            if response:
+                print("HTTP:", response.status)
 
-            if response.status_code != 200:
-                break
+            page.wait_for_timeout(8000)
 
-            soup = BeautifulSoup(response.text, "html.parser")
+            print("頁面標題：", page.title())
+            print("目前網址：", page.url)
 
-            # 找商品連結
-            product_links = []
+            # 往下捲動，觸發 lazy loading
+            previous_height = 0
 
-            for a in soup.find_all("a", href=True):
+            for i in range(12):
 
-                href = a.get("href", "")
-
-                # Watsons 商品網址通常包含 /p/
-                if "/p/" not in href:
-                    continue
-
-                full_url = urljoin(WATSONS_BASE, href)
-
-                if full_url not in product_links:
-                    product_links.append(full_url)
-
-            print("找到商品連結：", len(product_links))
-
-            # 沒商品代表翻到底
-            if len(product_links) == 0:
-                print("沒有更多商品，停止翻頁")
-                break
-
-            found_this_page = 0
-
-            for product_url in product_links:
-
-                # 找對應商品區塊
-                product_link = soup.find(
-                    "a",
-                    href=lambda x:
-                    x and product_url.split(WATSONS_BASE)[-1] in x
+                height = page.evaluate(
+                    "document.body.scrollHeight"
                 )
 
-                if not product_link:
-                    continue
+                print(
+                    f"Scroll {i + 1}:",
+                    height
+                )
 
-                # 往上找商品容器
-                container = product_link
+                page.evaluate(
+                    "window.scrollTo(0, document.body.scrollHeight)"
+                )
 
-                for _ in range(8):
+                page.wait_for_timeout(1500)
 
-                    if not container:
-                        break
+                if height == previous_height:
+                    break
 
-                    text = container.get_text(
-                        " ",
-                        strip=True
+                previous_height = height
+
+            html = page.content()
+
+            print(
+                "HTML 長度：",
+                len(html)
+            )
+
+            body_text = page.locator(
+                "body"
+            ).inner_text()
+
+            print(
+                "頁面文字長度：",
+                len(body_text)
+            )
+
+            print("")
+            print("===== 頁面前 2000 字 =====")
+            print(body_text[:2000])
+            print("===== 結束 =====")
+            print("")
+
+            # 找出所有連結
+            links = page.locator("a").all()
+
+            print(
+                "全部連結數：",
+                len(links)
+            )
+
+            seen_urls = set()
+
+            for link in links:
+
+                try:
+
+                    href = link.get_attribute(
+                        "href"
                     )
 
-                    # 找到至少兩個價格就停止往上
-                    prices = re.findall(
-                        r"\$\s*[\d,]+",
-                        text
+                    if not href:
+                        continue
+
+                    full_url = urljoin(
+                        WATSONS_BASE,
+                        href
                     )
 
-                    if len(prices) >= 2:
-                        break
+                    # 商品網址通常包含 product / p / sku 等資訊
+                    href_lower = href.lower()
 
-                    container = container.parent
+                    possible_product = (
+                        "/p/" in href_lower
+                        or "/product/" in href_lower
+                        or "product" in href_lower
+                    )
 
-                if not container:
-                    continue
+                    if not possible_product:
+                        continue
 
-                text = container.get_text(
-                    " ",
-                    strip=True
-                )
+                    if full_url in seen_urls:
+                        continue
 
-                # 排除買多件優惠
-                blocked_words = [
-                    "買2件",
-                    "買二件",
-                    "第二件",
-                    "第2件",
-                    "買一送一",
-                    "買1送1",
-                    "加價購"
-                ]
+                    seen_urls.add(full_url)
 
-                blocked = False
+                    # 往上找包含價格的商品卡
+                    card = link
 
-                for word in blocked_words:
-                    if word in text:
-                        blocked = True
-                        break
+                    card_text = ""
 
-                if blocked:
-                    continue
+                    for _ in range(10):
 
-                # 商品名稱
-                name = product_link.get_text(
-                    " ",
-                    strip=True
-                )
+                        try:
+                            card_text = card.inner_text(
+                                timeout=1000
+                            )
+                        except:
+                            card_text = ""
 
-                if not name:
-                    continue
+                        prices = re.findall(
+                            r"\$\s*[\d,]+",
+                            card_text
+                        )
 
-                # 找價格
-                price_texts = re.findall(
-                    r"\$\s*([\d,]+)",
-                    text
-                )
+                        if len(prices) >= 2:
+                            break
 
-                prices = []
+                        card = card.locator("..")
 
-                for p in price_texts:
+                    if not card_text:
+                        continue
 
-                    value = clean_price(p)
+                    if blocked(card_text):
+                        continue
 
-                    if value and value not in prices:
-                        prices.append(value)
+                    price_matches = re.findall(
+                        r"\$\s*([\d,]+)",
+                        card_text
+                    )
 
-                if len(prices) < 2:
-                    continue
+                    price_values = []
 
-                # Watsons 商品卡通常：
-                # 售價較低
-                # 原價較高
-                sale = min(prices)
-                original = max(prices)
+                    for price in price_matches:
 
-                before = len(products)
+                        value = clean_price(
+                            price
+                        )
 
-                add_product(
-                    products,
-                    "屈臣氏",
-                    name,
-                    original,
-                    sale,
-                    product_url
-                )
+                        if (
+                            value
+                            and value not in price_values
+                        ):
+                            price_values.append(
+                                value
+                            )
 
-                if len(products) > before:
+                    if len(price_values) < 2:
+                        continue
 
-                    found_this_page += 1
+                    sale = min(
+                        price_values
+                    )
 
-                    print(
-                        "★",
-                        name[:35],
+                    original = max(
+                        price_values
+                    )
+
+                    # 優先使用連結文字當商品名稱
+                    name = ""
+
+                    try:
+                        name = link.inner_text(
+                            timeout=1000
+                        ).strip()
+                    except:
+                        pass
+
+                    # 連結本身沒文字時，用商品卡文字第一行
+                    if not name:
+
+                        lines = [
+                            x.strip()
+                            for x in card_text.splitlines()
+                            if x.strip()
+                        ]
+
+                        for line in lines:
+
+                            if "$" in line:
+                                continue
+
+                            if len(line) < 3:
+                                continue
+
+                            name = line
+                            break
+
+                    if not name:
+                        continue
+
+                    if add_product(
+                        products,
+                        name,
                         original,
-                        "→",
-                        sale
-                    )
+                        sale,
+                        full_url
+                    ):
 
+                        print(
+                            "★",
+                            name[:50],
+                            f"${original}",
+                            "→",
+                            f"${sale}"
+                        )
+
+                except Exception:
+                    continue
+
+            print("")
             print(
-                "本頁找到5折以下：",
-                found_this_page
+                "疑似商品網址：",
+                len(seen_urls)
             )
 
-            page += 1
-
-            # 避免對網站造成太密集請求
-            time.sleep(1)
-
-        except Exception as e:
-
             print(
-                "頁面讀取失敗：",
-                e
+                "符合5折以下：",
+                len(products)
             )
 
-            break
+        finally:
+
+            browser.close()
 
 
 def remove_duplicates(products):
@@ -292,16 +373,22 @@ def remove_duplicates(products):
 
         unique[key] = product
 
-    return list(unique.values())
+    return list(
+        unique.values()
+    )
 
 
 def main():
 
     products = []
 
-    scrape_watsons(products)
+    scrape_watsons(
+        products
+    )
 
-    products = remove_duplicates(products)
+    products = remove_duplicates(
+        products
+    )
 
     products.sort(
         key=lambda x: x["rate"]
@@ -337,14 +424,14 @@ def main():
         )
 
     print("")
-    print("========================")
+    print("==============================")
     print("完成")
     print(
         "5折以下商品：",
         len(products),
         "個"
     )
-    print("========================")
+    print("==============================")
 
 
 if __name__ == "__main__":
