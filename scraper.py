@@ -6,14 +6,10 @@ import time
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urljoin
 
-
-# =========================================================
-# 設定
-# =========================================================
-
 MAX_DISCOUNT_RATE = 0.50
 
-BASE_URL = "https://www.poyabuy.com.tw"
+WATSONS_URL = "https://www.watsons.com.tw/全部商品/c/1"
+WATSONS_BASE = "https://www.watsons.com.tw"
 
 HEADERS = {
     "User-Agent": (
@@ -24,36 +20,17 @@ HEADERS = {
 }
 
 
-# 寶雅主要分類
-POYA_CATEGORIES = [
-    "https://www.poyabuy.com.tw/v2/official/SalePageCategory/373989",  # 臉部保養
-    "https://www.poyabuy.com.tw/v2/official/SalePageCategory/373990",  # 身體保養
-    "https://www.poyabuy.com.tw/v2/official/SalePageCategory/374010",  # 個人清潔
-    "https://www.poyabuy.com.tw/v2/official/SalePageCategory/569599",  # 清潔美容
-    "https://www.poyabuy.com.tw/v2/official/SalePageCategory/566579",  # 臉部清潔卸妝
-    "https://www.poyabuy.com.tw/v2/official/SalePageCategory/374096",  # 身體清潔
-]
-
-
-# =========================================================
-# 工具
-# =========================================================
-
 def clean_price(text):
     if not text:
         return None
 
     text = text.replace(",", "")
+    match = re.search(r"\$?\s*(\d+)", text)
 
-    numbers = re.findall(r"\d+", text)
-
-    if not numbers:
+    if not match:
         return None
 
-    try:
-        return int(numbers[0])
-    except:
-        return None
+    return int(match.group(1))
 
 
 def add_product(products, store, name, original, sale, url):
@@ -72,11 +49,14 @@ def add_product(products, store, name, original, sale, url):
     if rate > MAX_DISCOUNT_RATE:
         return
 
-    # 排除特殊促銷字樣
+    # 排除條件式優惠
     bad_words = [
-        "買一送一",
+        "買2件",
+        "買二件",
         "第二件",
         "第2件",
+        "買一送一",
+        "買1送1",
         "加價購",
         "任選",
         "任2",
@@ -101,239 +81,203 @@ def add_product(products, store, name, original, sale, url):
     })
 
 
-# =========================================================
-# 從分類頁找商品網址
-# =========================================================
+def scrape_watsons(products):
 
-def get_product_urls():
+    print("")
+    print("========================")
+    print("開始掃描屈臣氏")
+    print("========================")
 
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    product_urls = set()
+    page = 0
+    max_pages = 1000
 
-    for category_url in POYA_CATEGORIES:
+    while page < max_pages:
+
+        url = f"{WATSONS_URL}?page={page}"
 
         print("")
-        print("掃描分類：")
-        print(category_url)
+        print("掃描第", page + 1, "頁")
+        print(url)
 
         try:
 
-            response = session.get(
-                category_url,
-                timeout=30
-            )
+            response = session.get(url, timeout=30)
 
             print("HTTP:", response.status_code)
 
             if response.status_code != 200:
-                continue
+                break
 
-            soup = BeautifulSoup(
-                response.text,
-                "html.parser"
-            )
+            soup = BeautifulSoup(response.text, "html.parser")
 
-            # 找所有商品頁連結
+            # 找商品連結
+            product_links = []
+
             for a in soup.find_all("a", href=True):
 
                 href = a.get("href", "")
 
-                if "/SalePage/Index/" not in href:
+                # Watsons 商品網址通常包含 /p/
+                if "/p/" not in href:
                     continue
 
-                full_url = urljoin(
-                    BASE_URL,
-                    href
+                full_url = urljoin(WATSONS_BASE, href)
+
+                if full_url not in product_links:
+                    product_links.append(full_url)
+
+            print("找到商品連結：", len(product_links))
+
+            # 沒商品代表翻到底
+            if len(product_links) == 0:
+                print("沒有更多商品，停止翻頁")
+                break
+
+            found_this_page = 0
+
+            for product_url in product_links:
+
+                # 找對應商品區塊
+                product_link = soup.find(
+                    "a",
+                    href=lambda x:
+                    x and product_url.split(WATSONS_BASE)[-1] in x
                 )
 
-                # 清掉 query string
-                full_url = full_url.split("?")[0]
+                if not product_link:
+                    continue
 
-                product_urls.add(full_url)
+                # 往上找商品容器
+                container = product_link
+
+                for _ in range(8):
+
+                    if not container:
+                        break
+
+                    text = container.get_text(
+                        " ",
+                        strip=True
+                    )
+
+                    # 找到至少兩個價格就停止往上
+                    prices = re.findall(
+                        r"\$\s*[\d,]+",
+                        text
+                    )
+
+                    if len(prices) >= 2:
+                        break
+
+                    container = container.parent
+
+                if not container:
+                    continue
+
+                text = container.get_text(
+                    " ",
+                    strip=True
+                )
+
+                # 排除買多件優惠
+                blocked_words = [
+                    "買2件",
+                    "買二件",
+                    "第二件",
+                    "第2件",
+                    "買一送一",
+                    "買1送1",
+                    "加價購"
+                ]
+
+                blocked = False
+
+                for word in blocked_words:
+                    if word in text:
+                        blocked = True
+                        break
+
+                if blocked:
+                    continue
+
+                # 商品名稱
+                name = product_link.get_text(
+                    " ",
+                    strip=True
+                )
+
+                if not name:
+                    continue
+
+                # 找價格
+                price_texts = re.findall(
+                    r"\$\s*([\d,]+)",
+                    text
+                )
+
+                prices = []
+
+                for p in price_texts:
+
+                    value = clean_price(p)
+
+                    if value and value not in prices:
+                        prices.append(value)
+
+                if len(prices) < 2:
+                    continue
+
+                # Watsons 商品卡通常：
+                # 售價較低
+                # 原價較高
+                sale = min(prices)
+                original = max(prices)
+
+                before = len(products)
+
+                add_product(
+                    products,
+                    "屈臣氏",
+                    name,
+                    original,
+                    sale,
+                    product_url
+                )
+
+                if len(products) > before:
+
+                    found_this_page += 1
+
+                    print(
+                        "★",
+                        name[:35],
+                        original,
+                        "→",
+                        sale
+                    )
 
             print(
-                "目前累計商品網址：",
-                len(product_urls)
+                "本頁找到5折以下：",
+                found_this_page
             )
+
+            page += 1
+
+            # 避免對網站造成太密集請求
+            time.sleep(1)
 
         except Exception as e:
 
             print(
-                "分類讀取失敗：",
+                "頁面讀取失敗：",
                 e
             )
 
-        time.sleep(1)
+            break
 
-    return list(product_urls)
-
-
-# =========================================================
-# 解析商品頁
-# =========================================================
-
-def parse_product_page(session, url):
-
-    try:
-
-        response = session.get(
-            url,
-            timeout=30
-        )
-
-        if response.status_code != 200:
-            return None
-
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser"
-        )
-
-        # -----------------------------
-        # 商品名稱
-        # -----------------------------
-
-        name = None
-
-        og_title = soup.find(
-            "meta",
-            property="og:title"
-        )
-
-        if og_title:
-            name = og_title.get("content")
-
-        if not name and soup.title:
-            name = soup.title.get_text(
-                strip=True
-            )
-
-        if not name:
-            return None
-
-        # -----------------------------
-        # 取得頁面文字
-        # -----------------------------
-
-        page_text = soup.get_text(
-            " ",
-            strip=True
-        )
-
-        # 排除特殊促銷
-        blocked_words = [
-            "加價購商品",
-            "下單請選購兩件"
-        ]
-
-        for word in blocked_words:
-            if word in page_text:
-                return None
-
-        # -----------------------------
-        # 找 NT$ 價格
-        # -----------------------------
-
-        price_matches = re.findall(
-            r"NT\$\s*([\d,]+)",
-            page_text
-        )
-
-        prices = []
-
-        for price in price_matches:
-
-            p = clean_price(price)
-
-            if p and p not in prices:
-                prices.append(p)
-
-        if len(prices) < 2:
-            return None
-
-        # 寶雅頁面可能出現多個價格
-        # 先取合理的最高價當原價
-        # 最低價當目前售價
-
-        original = max(prices)
-        sale = min(prices)
-
-        if original == sale:
-            return None
-
-        return {
-            "name": name,
-            "original": original,
-            "sale": sale,
-            "url": url
-        }
-
-    except Exception as e:
-
-        print(
-            "商品解析失敗：",
-            url,
-            e
-        )
-
-        return None
-
-
-# =========================================================
-# 寶雅
-# =========================================================
-
-def scrape_poya(products):
-
-    print("")
-    print("========================")
-    print("開始掃描寶雅")
-    print("========================")
-
-    urls = get_product_urls()
-
-    print("")
-    print(
-        "共找到",
-        len(urls),
-        "個商品網址"
-    )
-
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    for index, url in enumerate(urls, 1):
-
-        print(
-            f"[{index}/{len(urls)}]",
-            url
-        )
-
-        item = parse_product_page(
-            session,
-            url
-        )
-
-        if not item:
-            continue
-
-        add_product(
-            products,
-            "寶雅",
-            item["name"],
-            item["original"],
-            item["sale"],
-            item["url"]
-        )
-
-        time.sleep(0.3)
-
-
-# =========================================================
-# 去除重複
-# =========================================================
 
 def remove_duplicates(products):
 
@@ -351,21 +295,14 @@ def remove_duplicates(products):
     return list(unique.values())
 
 
-# =========================================================
-# 主程式
-# =========================================================
-
 def main():
 
     products = []
 
-    scrape_poya(products)
+    scrape_watsons(products)
 
-    products = remove_duplicates(
-        products
-    )
+    products = remove_duplicates(products)
 
-    # 折扣最低排最前面
     products.sort(
         key=lambda x: x["rate"]
     )
